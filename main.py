@@ -21,7 +21,8 @@ from datetime import date, datetime, timedelta
 from enum import Enum, auto
 from itertools import cycle
 from pathlib import Path
-from typing import Union, List, Literal, Final, NamedTuple
+from types import TracebackType
+from typing import Union, List, Literal, Final, NamedTuple, Type
 import copy
 from pytz import timezone
 import traceback
@@ -33,6 +34,7 @@ from requests_oauthlib import OAuth2Session
 from functools import wraps
 from func_timeout import FunctionTimedOut, func_set_timeout
 from notifiers import get_notifier
+from apprise import Apprise, NotifyFormat
 from keep_alivev2 import keep_alive
 from random_word import RandomWords
 from userAgentGenerator import GenerateUserAgent
@@ -315,6 +317,18 @@ def browserSetupv2(isMobile: bool = False, proxy: str = None) -> WebDriver:
 def browserSetupv3(isMobile: bool = False, proxy: str = None) -> WebDriver:
     """Create Chrome browser"""
     
+    def getBrowserConfig(sessionPath: Path) -> dict | None:
+        configFile = sessionPath / "config.json"
+        if not configFile.exists():
+            return
+        with open(configFile, "r") as f:
+            return json.load(f)
+    
+    def saveBrowserConfig(sessionPath: Path, config: dict) -> None:
+        configFile = sessionPath / "config.json"
+        with open(configFile, "w") as f:
+            json.dump(config, f)
+
     def setupProfiles() -> Path:
         """
         Sets up the sessions profile for the chrome browser.
@@ -332,14 +346,19 @@ def browserSetupv3(isMobile: bool = False, proxy: str = None) -> WebDriver:
         sessionsDir.mkdir(parents=True, exist_ok=True)
         return sessionsDir
     
-    user_agent = GenerateUserAgent().userAgent(browserConfig={}, mobile=isMobile)[0]
+    user_data = setupProfiles()
+    browserConfig = getBrowserConfig(user_data)
+    user_agent = GenerateUserAgent().userAgent(browserConfig=browserConfig, mobile=isMobile)
+    newBrowserConfig = user_agent[2]
+    if newBrowserConfig:
+        browserConfig = newBrowserConfig
+        saveBrowserConfig(user_data, browserConfig)
     from selenium.webdriver.edge.options import Options as EdgeOptions
     if ARGS.edge:
         options = EdgeOptions()
     else:
         options = uc.ChromeOptions()
-    user_data = setupProfiles()
-    options.add_argument("--user-agent=" + user_agent)
+    options.add_argument("--user-agent=" + user_agent[0])
     options.add_argument('--lang=' + LANG.split("-")[0])
     prefs = {"profile.default_content_setting_values.geolocation" :2,
                     "profile.default_content_setting_values.notifications": 2,
@@ -391,7 +410,70 @@ def browserSetupv3(isMobile: bool = False, proxy: str = None) -> WebDriver:
         browser = edgedriver.Edge(service=EdgeService(EdgeChromiumDriverManager().install()), options=options)
     else:
         # browser = uc.Chrome(driver_executable_path="chromedriver", options=options, use_subprocess=False, user_data_dir= user_data if ARGS.session or ARGS.account_browser else None, no_sandbox=False)
-        browser = uc.Chrome(driver_executable_path="chromedriver", options=options, use_subprocess=False, user_data_dir= user_data.as_posix() if ARGS.session or ARGS.account_browser else None, no_sandbox=False)
+        browser = uc.Chrome(driver_executable_path="chromedriver", options=options, user_data_dir= user_data.as_posix() if ARGS.session or ARGS.account_browser else None, no_sandbox=False)
+    if browserConfig.get("sizes"):
+            deviceHeight = browserConfig["sizes"]["height"]
+            deviceWidth = browserConfig["sizes"]["width"]
+    else:
+        if isMobile:
+            deviceHeight = random.randint(568, 1024)
+            deviceWidth = random.randint(320, min(576, int(deviceHeight * 0.7)))
+        else:
+            deviceWidth = random.randint(1024, 2560)
+            deviceHeight = random.randint(768, min(1440, int(deviceWidth * 0.8)))
+        browserConfig["sizes"] = {
+            "height": deviceHeight,
+            "width": deviceWidth,
+        }
+        saveBrowserConfig(user_data, browserConfig)
+
+    if isMobile:
+        screenHeight = deviceHeight + 146
+        screenWidth = deviceWidth
+    else:
+        screenWidth = deviceWidth + 55
+        screenHeight = deviceHeight + 151
+
+    print(f"Screen size: {screenWidth}x{screenHeight}")
+    print(f"Device size: {deviceWidth}x{deviceHeight}")
+
+    if isMobile:
+        browser.execute_cdp_cmd(
+            "Emulation.setTouchEmulationEnabled",
+            {
+                "enabled": True,
+            },
+        )
+
+    browser.execute_cdp_cmd(
+        "Emulation.setDeviceMetricsOverride",
+        {
+            "width": deviceWidth,
+            "height": deviceHeight,
+            "deviceScaleFactor": 0,
+            "mobile": isMobile,
+            "screenWidth": screenWidth,
+            "screenHeight": screenHeight,
+            "positionX": 0,
+            "positionY": 0,
+            "viewport": {
+                "x": 0,
+                "y": 0,
+                "width": deviceWidth,
+                "height": deviceHeight,
+                "scale": 1,
+            },
+        },
+    )
+
+    browser.execute_cdp_cmd(
+        "Emulation.setUserAgentOverride",
+        {
+            "userAgent": user_agent[0],
+            "platform": user_agent[1]["platform"],
+            "userAgentMetadata": user_agent[1],
+        },
+    )
     return browser
 
 @retry_on_500_errors
@@ -623,7 +705,6 @@ def checkRewardsLogin(browser: WebDriver):
         pass
     # Check for ErrorMessage
     try:
-        browser.find_element(By.ID, 'error').is_displayed()
         # Check wheter account suspended or not
         if 'Your Microsoft Rewards account has been suspended.' in browser.find_element(By.XPATH, '//*[@id="suspendedAccountHeader"]').get_attribute(
                 'innerHTML'):
@@ -788,6 +869,11 @@ def close_all_but_main(browser: WebDriver):
         print('Error when switching to main_window')
     finally:
         browser.switch_to.window(browser.window_handles[0])
+
+def open_in_new_tab(browser: WebDriver, url: str):
+    browser.execute_script("window.open('');")
+    goto_latest_window(browser, time_to_wait=9)
+    goToURL(browser, url)
 
 def goto_latest_window(browser: WebDriver, time_to_wait: int = 0):
     """
@@ -1005,7 +1091,7 @@ class Searches:
         # Function to retrieve related terms from Bing API
         relatedTerms: list[str] = requests.get(
             f"https://api.bing.com/osjson.aspx?query={term}",
-            headers={"User-agent": GenerateUserAgent().userAgent(browserConfig={}, mobile=self.isMobile)[0]},
+            headers={"User-agent": GenerateUserAgent().userAgent(browserConfig=None, mobile=self.isMobile)[0]},
         ).json()[1]
         if not relatedTerms:
             return [term]
@@ -1206,6 +1292,7 @@ def locateQuestCard(browser: WebDriver, activity: dict) -> WebElement:
     
 def openDailySetActivity(browser: WebDriver, cardId: int):
         # browser.find_element(By.XPATH, f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a').click()
+        waitUntilClickable(browser, By.XPATH, f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a', 15)
         card = browser.execute_script(f'return document.querySelector("mee-rewards-daily-set-section").children[0].querySelector("mee-card-group").children[0].children[{cardId}]')
         card.click()
         time.sleep(2)
@@ -1225,6 +1312,7 @@ def openMorePromotionsActivity(browser: WebDriver, cardId: int):
             if isElementExists(browser, By.XPATH, '//*[@id="modal-host"]/div[2]/button'):
                 return
         goto_latest_window(browser, time_to_wait=15)
+        # print(f'Current URL After Opening: {browser.current_url}')
         
 
 def completeReadToEarn(browser: WebDriver, startingPoints: int):
@@ -1292,6 +1380,10 @@ def completeDailySet(browser: WebDriver):
         except:
             pass
         time.sleep(calculateSleep(15))
+        html = browser.find_element(By.TAG_NAME, 'html')
+        for _ in range(3):
+            html.send_keys(Keys.END)
+            html.send_keys(Keys.HOME)
         close_all_but_main(browser)
         time.sleep(2)
 
@@ -1307,7 +1399,7 @@ def completeDailySet(browser: WebDriver):
             browser.find_element(By.ID, 'bnp_hfly_cta2').click()
             time.sleep(2)
         waitUntilClickable(browser, By.ID, "btoption0", 15)
-        time.sleep(1.5)
+        time.sleep(3)
         browser.find_element(By.ID, "btoption" +
                              str(random.randint(0, 1))).click()
         time.sleep(calculateSleep(10))
@@ -1467,6 +1559,7 @@ def completeDailySet(browser: WebDriver):
         time.sleep(2)
 
     print('[DAILY SET]', 'Trying to complete the Daily Set...')
+    browser.execute_script("window.scrollTo(0, 1080)")
     d = getDashboardData(browser)
     error = False
     todayDate = datetime.today().strftime('%m/%d/%Y')
@@ -1477,55 +1570,63 @@ def completeDailySet(browser: WebDriver):
             todayPack = data
     for activity in todayPack:
         try:
-            if not activity['complete']:
-                # cardNumber = int(activity['offerId'][-1:])
-                cardNumber = i
-                openDailySetActivity(browser, cardId=cardNumber)
-                print(f'Card Name: {activity["title"]}')
-                if activity['promotionType'] == "urlreward":
-                    if "poll" in activity['title']:
-                        searchUrl = urllib.parse.unquote(
-                            urllib.parse.parse_qs(urllib.parse.urlparse(activity['destinationUrl']).query)['ru'][0])
-                        searchUrlQueries = urllib.parse.parse_qs(
-                            urllib.parse.urlparse(searchUrl).query)
-                        filters = {}
-                        for filter in searchUrlQueries['filters'][0].split(" "):
-                            filter = filter.split(':', 1)
-                            filters[filter[0]] = filter[1]
-                        if "PollScenarioId" in filters:
-                            print(
-                                '[DAILY SET]', 'Completing poll of card ' + str(cardNumber))
-                            completeDailySetSurvey()
-                    else:
-                        print('[DAILY SET]',
-                                'Completing search of card ' + str(cardNumber))
-                        completeDailySetSearch()
-                if activity['promotionType'] == "quiz":
-                    if activity['pointProgressMax'] == 50 and activity['pointProgress'] == 0:
+            if activity['complete'] is not False:
+                i += 1
+                continue
+            # cardNumber = int(activity['offerId'][-1:])
+            cardNumber = i
+            print(f'Card Name: {activity["title"]}')
+            open_in_new_tab(browser, url = activity["destinationUrl"])
+            # openDailySetActivity(browser, cardId=cardNumber)
+            i += 1
+            if activity['promotionType'] == "urlreward":
+                if "poll" in activity['title']:
+                    searchUrl = urllib.parse.unquote(
+                        urllib.parse.parse_qs(urllib.parse.urlparse(activity['destinationUrl']).query)['ru'][0])
+                    searchUrlQueries = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(searchUrl).query)
+                    filters = {}
+                    for filter in searchUrlQueries['filters'][0].split(" "):
+                        filter = filter.split(':', 1)
+                        filters[filter[0]] = filter[1]
+                    if "PollScenarioId" in filters:
                         print(
-                            '[DAILY SET]', 'Completing This or That of card ' + str(cardNumber))
-                        completeDailySetThisOrThat()
-                    elif (activity['pointProgressMax'] == 40 or activity['pointProgressMax'] == 30) and activity['pointProgress'] == 0:
-                        print('[DAILY SET]',
-                                'Completing quiz of card ' + str(cardNumber))
-                        completeDailySetQuiz()
-                    elif activity['pointProgressMax'] == 10 and activity['pointProgress'] == 0:
-                        searchUrl = urllib.parse.unquote(
-                            urllib.parse.parse_qs(urllib.parse.urlparse(activity['destinationUrl']).query)['ru'][0])
-                        searchUrlQueries = urllib.parse.parse_qs(
-                            urllib.parse.urlparse(searchUrl).query)
-                        filters = {}
-                        for filter in searchUrlQueries['filters'][0].split(" "):
-                            filter = filter.split(':', 1)
-                            filters[filter[0]] = filter[1]
-                        if "PollScenarioId" in filters:
-                            print(
-                                '[DAILY SET]', 'Completing poll of card ' + str(cardNumber))
-                            completeDailySetSurvey()
-                        else:
-                            print(
-                                '[DAILY SET]', 'Completing quiz of card ' + str(cardNumber))
-                            completeDailySetVariableActivity()
+                            '[DAILY SET]', 'Completing poll of card ' + str(cardNumber))
+                        completeDailySetSurvey()
+                elif "weekly+quiz" in activity["destinationUrl"] or "homepage+quiz" in activity["destinationUrl"]:
+                    print(
+                            '[DAILY SET]', 'Completing quiz of card ' + str(cardNumber))
+                    completeDailySetVariableActivity()
+                else:
+                    print('[DAILY SET]',
+                            'Completing search of card ' + str(cardNumber))
+                    completeDailySetSearch()
+            if activity['promotionType'] == "quiz":
+                if activity['pointProgressMax'] == 50 and activity['pointProgress'] == 0:
+                    print(
+                        '[DAILY SET]', 'Completing This or That of card ' + str(cardNumber))
+                    completeDailySetThisOrThat()
+                elif (activity['pointProgressMax'] == 40 or activity['pointProgressMax'] == 30) and activity['pointProgress'] == 0:
+                    print('[DAILY SET]',
+                            'Completing quiz of card ' + str(cardNumber))
+                    completeDailySetQuiz()
+                elif activity['pointProgressMax'] == 10 and activity['pointProgress'] == 0:
+                    searchUrl = urllib.parse.unquote(
+                        urllib.parse.parse_qs(urllib.parse.urlparse(activity['destinationUrl']).query)['ru'][0])
+                    searchUrlQueries = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(searchUrl).query)
+                    filters = {}
+                    for filter in searchUrlQueries['filters'][0].split(" "):
+                        filter = filter.split(':', 1)
+                        filters[filter[0]] = filter[1]
+                    if "PollScenarioId" in filters:
+                        print(
+                            '[DAILY SET]', 'Completing poll of card ' + str(cardNumber))
+                        completeDailySetSurvey()
+                    else:
+                        print(
+                            '[DAILY SET]', 'Completing quiz of card ' + str(cardNumber))
+                        completeDailySetVariableActivity()
         except Exception as exc:
             displayError(exc)
             error = True
@@ -1553,6 +1654,10 @@ def completePunchCards(browser: WebDriver):
                     browser.find_element(By.XPATH, "//a[@class='offer-cta']/div").click()
                     goto_latest_window(browser, random.randint(13, 17))
                     time.sleep(calculateSleep(7))
+                    html = browser.find_element(By.TAG_NAME, 'html')
+                    for _ in range(3):
+                        html.send_keys(Keys.END)
+                        html.send_keys(Keys.HOME)
                     close_all_but_main(browser)
                     time.sleep(2)
                 if child['promotionType'] == "quiz" and child['pointProgressMax'] >= 50:
@@ -1667,7 +1772,7 @@ def completeMorePromotions(browser: WebDriver):
             goToURL(browser, BASE_URL)
             time.sleep(2)
 
-    def completeMorePromotionSearch():
+    def completeMorePromotionSearch(word_to_search: str = None):
         """Complete more promotion search"""
         time.sleep(2.5)
         try:
@@ -1676,9 +1781,20 @@ def completeMorePromotions(browser: WebDriver):
                 return
         except:
             pass
-        time.sleep(calculateSleep(15))
-        close_all_but_main(browser)
+        time.sleep(calculateSleep(7))
+        if word_to_search is not None:
+            waitUntilClickable(browser, By.XPATH, '//*[@id="sb_form_q"]', time_to_wait=20)
+            searchbar = browser.find_element(By.XPATH, '//*[@id="sb_form_q"]')
+            searchbar.click()
+            searchbar.send_keys(word_to_search)
+            searchbar.submit()
+            time.sleep(7)
+        html = browser.find_element(By.TAG_NAME, 'html')
+        for _ in range(3):
+            html.send_keys(Keys.END)
+            html.send_keys(Keys.HOME)
         time.sleep(2)
+        close_all_but_main(browser)
 
     def completeMorePromotionQuiz():
         """Complete more promotion quiz"""
@@ -1815,108 +1931,56 @@ def completeMorePromotions(browser: WebDriver):
 
     print('[MORE PROMO]', 'Trying to complete More Promotions...')
     morePromotions: list[dict] = getDashboardData(browser)['morePromotions']
-    i = 0
+    # i = 0
     for promotion in morePromotions:
         try:
             promotionTitle = promotion["title"]
             # print(f"promotionTitle={promotionTitle}")
             if (promotion["complete"] is not False or promotion["pointProgressMax"] == 0):
-                continue
-            if "Mid-week puzzle" in promotionTitle:
-                print(
-                    "Mid-week puzzle found",
-                    "MS-Rewards-Farmer detected mid-week puzzle activity, which isn't supported."
-                    " Please manually complete",
-                )
+                # i += 1
                 continue
             if promotion["exclusiveLockedFeatureStatus"] == "locked":
+                # i += 1
                 continue
+            # if "Mid-week puzzle" in promotionTitle:
+            #     print(
+            #         "Mid-week puzzle found",
+            #         "MS-Rewards-Farmer detected mid-week puzzle activity, which isn't supported."
+            #         " Please manually complete",
+            #     )
+            #     # i += 1
+            #     continue
+            browser.execute_script("window.scrollTo(0, 1080)")
             print(f"promotionTitle={promotionTitle}")
-            openMorePromotionsActivity(browser, cardId=i)
-            i += 1
+            openMorePromotionsActivity(browser, cardId=morePromotions.index(promotion))
+            # i += 1
             if re.match(r".*\/legaltextbox", browser.current_url):
                 time.sleep(5)
                 if isElementExists(browser, By.XPATH, '//*[@id="modal-host"]/div[2]/button'):
-                    # print("Clicking Close Dialog")
                     browser.find_element(By.XPATH, '//*[@id="modal-host"]/div[2]/button').click()
                     continue
             if "Search the lyrics of a song" in promotionTitle:
-                    goToURL(browser, "https://www.bing.com/search?q=black+sabbath+supernaut+lyrics")
-                    time.sleep(8)
-                    close_all_but_main(browser)
+                completeMorePromotionSearch("black sabbath supernaut lyrics")
             elif "Translate anything" in promotionTitle:
-                goToURL(browser, "https://www.bing.com/search?q=translate+pencil+sharpener+to+spanish")
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch(browser, "translate pencil sharpener to spanish")
             elif "Discover open job roles" in promotionTitle:
-                goToURL(browser, "https://www.bing.com/search?q=walmart+open+job+roles")
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("walmart open job roles")
             elif "Plan a quick getaway" in promotionTitle:
-                goToURL(browser, "https://www.bing.com/search?q=flights+nyc+to+paris")
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("flights nyc to paris")
             elif "You can track your package" in promotionTitle:
-                waitUntilClickable(
-                    browser, By.ID, "sb_form_q", time_to_wait=20
-                )
-                searchbar = browser.find_element(By.ID, "sb_form_q")
-                searchbar.click()
-                searchbar.send_keys("usps tracking")
-                searchbar.submit()
-
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("usps tracking")
+                # bar = browser.execute_script('reutrn document.getElementsByClassName("tracking_Number_Input")[0].children[1]')
+                # bar.click()
             elif "Find somewhere new to explore" in promotionTitle:
-                goToURL(browser, 
-                    "https://www.bing.com/search?q=directions+to+new+york"
-                )
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("directions to new york")
             elif "Too tired to cook tonight?" in promotionTitle:
-                waitUntilClickable(
-                    browser, By.ID, "sb_form_q", time_to_wait=20
-                )
-                searchbar = browser.find_element(By.ID, "sb_form_q")
-                searchbar.click()
-                searchbar.send_keys("pizza delivery near me")
-                searchbar.submit()
-
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("pizza delivery near me")
             elif "Prepare for the weather​" in promotionTitle:
-                waitUntilClickable(
-                    browser, By.ID, "sb_form_q", time_to_wait=20
-                )
-                searchbar = browser.find_element(By.ID, "sb_form_q")
-                searchbar.click()
-                searchbar.send_keys("upcoming weather")
-                searchbar.submit()
-
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("upcoming weather")
             elif "Quickly convert your money" in promotionTitle:
-                waitUntilClickable(
-                    browser, By.ID, "sb_form_q", time_to_wait=20
-                )
-                searchbar = browser.find_element(By.ID, "sb_form_q")
-                searchbar.click()
-                searchbar.send_keys("convert 374 usd to yen")
-                searchbar.submit()
-
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("convert 374 usd to yen")
             elif "Learn to cook a new recipe" in promotionTitle:
-                waitUntilClickable(
-                    browser, By.ID, "sb_form_q", time_to_wait=20
-                )
-                searchbar = browser.find_element(By.ID, "sb_form_q")
-                searchbar.click()
-                searchbar.send_keys("how cook pierogi")
-                searchbar.submit()
-
-                time.sleep(8)
-                close_all_but_main(browser)
+                completeMorePromotionSearch("how cook pierogi")
             elif promotion['promotionType'] == "welcometour":
                 completeMorePromotionWelcometour()
             elif promotion['promotionType'] == "urlreward" or promotion['promotionType'] == "":
@@ -2477,10 +2541,8 @@ def argumentParser():
                         action='store_true',
                         required=False)
     parser.add_argument('--discord',
-                        metavar='<WEBHOOK_URL>',
-                        nargs=1,
                         help='This argument takes webhook url to send logs to Discord.',
-                        type=str,
+                        action='store_true',
                         required=False)
     parser.add_argument('--edge',
                         help='Use Microsoft Edge webdriver instead of Chrome.',
@@ -2765,7 +2827,7 @@ def createMessage():
     BOT_NAME = os.environ.get("BOT_NAME")
     total_earned = 0
     total_overall = 0
-    message = f'*{BOT_NAME}*\n\n📅 Daily report {today}\n\n'
+    message = f'*{BOT_NAME}*\n\n📅 Daily report {today}\n\n' if ARGS.telegram else f'**{BOT_NAME}**\n\n📅 Daily report {today}\n\n'
     for index, value in enumerate(LOGS.items(), 1):
         redeem_message = None
         if value[1].get("Redeem goal title", None):
@@ -2865,7 +2927,7 @@ def sendReportToMessenger(message):
         sendToDiscord(message)
 
 
-def sendToTelegram(message):
+def sendToTelegramV1(message):
     """send to telegram"""
     t = get_notifier('telegram')
     if len(message) > 4096:
@@ -2877,18 +2939,28 @@ def sendToTelegram(message):
         t.notify(message=message,
                  token=os.environ.get("TOKEN", None), chat_id=os.environ.get("CHAT_ID", None), parse_mode= 'markdown')
 
+def sendToTelegram(message):
+    """send to telegram"""
+    apprise = Apprise()
+    apprise.add(os.environ.get("TOKEN", None))
+    if len(message) > 4096:
+        messages = [message[i:i+4096] for i in range(0, len(message), 4096)]
+        for ms in messages:
+            apprise.notify(body=ms, body_format=NotifyFormat.MARKDOWN)
+    else:
+        apprise.notify(body=message, body_format=NotifyFormat.MARKDOWN)
+
 
 def sendToDiscord(message):
     """send to discord"""
-    webhook_url = ARGS.discord[0]
+    webhook_url = os.environ.get("TOKEN", None)
     if len(message) > 2000:
         messages = [message[i:i + 2000] for i in range(0, len(message), 2000)]
         for ms in messages:
-            content = {"username": "⭐️ Microsoft Rewards Bot ⭐️", "content": ms}
+            content = {"content": ms}
             response = requests.post(webhook_url, json=content)
     else:
-        content = {"username": "⭐️ Microsoft Rewards Bot ⭐️",
-                   "content": message}
+        content = {"content": message}
         response = requests.post(webhook_url, json=content)
     if not ARGS.print_to_webhook:  # this is to prevent infinite loop
         if response.status_code == 204:
@@ -3399,7 +3471,7 @@ def farmer():
                 updateLogs()
             prYellow('********************' + hide_email(CURRENT_ACCOUNT) + '********************')
             if not LOGS[CURRENT_ACCOUNT]['PC searches']:
-                with browserSetupv3(False, account.get('proxy', None)) as browser :
+                with browserSetupv3(False, account.get('proxy', None)) as browser:
                     print('[LOGIN]', 'Logging-in...')
                     login(browser, account['username'], account['password'], account.get(
                         'totpSecret', None))
@@ -3409,7 +3481,7 @@ def farmer():
                             ' points on your account !')
                     goToURL(browser, BASE_URL)
                     waitUntilVisible(browser, By.ID, 'app-host', 30)
-                    redeem_goal_title, redeem_goal_price = getRedeemGoal(browser)
+                    # redeem_goal_title, redeem_goal_price = getRedeemGoal(browser)
 
                     # # Update goal if it is not the required one for auto-redeem
                     # if ARGS.redeem:
@@ -3438,6 +3510,7 @@ def farmer():
                         completePunchCards(browser)
                     if not LOGS[CURRENT_ACCOUNT]['More promotions']:
                         completeMorePromotions(browser)
+                    POINTS_COUNTER = getBingAccountPoints(browser)
                     # if not ARGS.skip_shopping and not LOGS[CURRENT_ACCOUNT]['MSN shopping game']:
                     #     finished = False
                     #     if ARGS.repeat_shopping:
@@ -3459,44 +3532,74 @@ def farmer():
                     ERROR = False
                     browser.quit()
 
-                    if MOBILE:
-                        with browserSetupv3(True, account.get('proxy', None)) as browser:
-                            print('[LOGIN]', 'Logging-in mobile...')
-                            login(browser, account['username'], account['password'], account.get(
-                                'totpSecret', None), True)
-                            prGreen('[LOGIN] Logged-in successfully !')
-                            if LOGS[account['username']]['PC searches'] and ERROR:
-                                STARTING_POINTS = POINTS_COUNTER
-                                goToURL(browser, BASE_URL)
-                                waitUntilVisible(browser, By.ID, 'app-host', 30)
-                                redeem_goal_title, redeem_goal_price = getRedeemGoal(browser)
-                                remainingSearches, remainingSearchesM = getRemainingSearches(browser, separateSearches=True)
-                            if remainingSearchesM != 0:
-                                print('[BING]', 'Starting Mobile Bing searches...')
-                                Searches(browser, True).bingSearches()
-                                POINTS_COUNTER = getBingAccountPoints(browser)
-                                prGreen('\n[BING] Finished Mobile Bing searches !')
-                            browser.quit()
-                    
-                if redeem_goal_title != "" and redeem_goal_price <= POINTS_COUNTER:
-                    prGreen(f"[POINTS] Account ready to redeem {redeem_goal_title} for {redeem_goal_price} points.")
-                    if ARGS.redeem and auto_redeem_counter < MAX_REDEEMS:
-                        # Start auto-redeem process
-                        with browserSetupv3(False, account.get('proxy', None)) as browser:
-                            print('[LOGIN]', 'Logging-in...')
-                            login(browser, account['username'], account['password'], account.get(
-                                'totpSecret', None))
-                            prGreen('[LOGIN] Logged-in successfully!')
-                            goToURL(browser, BASE_URL)
-                            waitUntilVisible(browser, By.ID, 'app-host', 30)
-                            redeemGoal(browser)
-                            browser.quit()
-                    if ARGS.telegram or ARGS.discord:
-                        LOGS[CURRENT_ACCOUNT]["Redeem goal title"] = redeem_goal_title
-                        LOGS[CURRENT_ACCOUNT]["Redeem goal price"] = redeem_goal_price
-                finishedAccount()
-                cleanLogs()
-                updateLogs()
+            if MOBILE:
+                with browserSetupv3(True, account.get('proxy', None)) as browser:
+                    print('[LOGIN]', 'Logging-in mobile...')
+                    login(browser, account['username'], account['password'], account.get(
+                        'totpSecret', None), True)
+                    prGreen('[LOGIN] Logged-in successfully !')
+                    if LOGS[account['username']]['PC searches'] and ERROR:
+                        STARTING_POINTS = POINTS_COUNTER
+                        goToURL(browser, BASE_URL)
+                        waitUntilVisible(browser, By.ID, 'app-host', 30)
+                        redeem_goal_title, redeem_goal_price = getRedeemGoal(browser)
+                        remainingSearches, remainingSearchesM = getRemainingSearches(browser, separateSearches=True)
+                    if remainingSearchesM != 0:
+                        print('[BING]', 'Starting Mobile Bing searches...')
+                        Searches(browser, True).bingSearches()
+                        POINTS_COUNTER = getBingAccountPoints(browser)
+                        prGreen('\n[BING] Finished Mobile Bing searches !')
+                    browser.quit()
+            # try:
+            #     if redeem_goal_title != "" and redeem_goal_price <= POINTS_COUNTER:
+            #         prGreen(f"[POINTS] Account ready to redeem {redeem_goal_title} for {redeem_goal_price} points.")
+            #         if ARGS.redeem and auto_redeem_counter < MAX_REDEEMS:
+            #             # Start auto-redeem process
+            #             with browserSetupv3(False, account.get('proxy', None)) as browser:
+            #                 print('[LOGIN]', 'Logging-in...')
+            #                 login(browser, account['username'], account['password'], account.get(
+            #                     'totpSecret', None))
+            #                 prGreen('[LOGIN] Logged-in successfully!')
+            #                 goToURL(browser, BASE_URL)
+            #                 waitUntilVisible(browser, By.ID, 'app-host', 30)
+            #                 redeemGoal(browser)
+            #                 browser.quit()
+            #         if ARGS.telegram or ARGS.discord:
+            #             LOGS[CURRENT_ACCOUNT]["Redeem goal title"] = redeem_goal_title
+            #             LOGS[CURRENT_ACCOUNT]["Redeem goal price"] = redeem_goal_price
+            # except:
+            #     with browserSetupv3(False, account.get('proxy', None)) as browser:
+            #         print('[LOGIN]', 'Logging-in...')
+            #         print('in Redeem Error...')
+            #         login(browser, account['username'], account['password'], account.get(
+            #             'totpSecret', None))
+            #         prGreen('[LOGIN] Logged-in successfully !')
+            #         STARTING_POINTS = getBingAccountPoints(browser)
+            #         prGreen('[POINTS] You have ' + str(STARTING_POINTS) +
+            #                 ' points on your account !')
+            #         goToURL(browser, BASE_URL)
+            #         waitUntilVisible(browser, By.ID, 'app-host', 30)
+            #         redeem_goal_title, redeem_goal_price = getRedeemGoal(browser)
+            #         browser.quit()
+            #     if redeem_goal_title != "" and redeem_goal_price <= POINTS_COUNTER:
+            #         prGreen(f"[POINTS] Account ready to redeem {redeem_goal_title} for {redeem_goal_price} points.")
+            #         if ARGS.redeem and auto_redeem_counter < MAX_REDEEMS:
+            #             # Start auto-redeem process
+            #             with browserSetupv3(False, account.get('proxy', None)) as browser:
+            #                 print('[LOGIN]', 'Logging-in...')
+            #                 login(browser, account['username'], account['password'], account.get(
+            #                     'totpSecret', None))
+            #                 prGreen('[LOGIN] Logged-in successfully!')
+            #                 goToURL(browser, BASE_URL)
+            #                 waitUntilVisible(browser, By.ID, 'app-host', 30)
+            #                 redeemGoal(browser)
+            #                 browser.quit()
+            #         if ARGS.telegram or ARGS.discord:
+            #             LOGS[CURRENT_ACCOUNT]["Redeem goal title"] = redeem_goal_title
+            #             LOGS[CURRENT_ACCOUNT]["Redeem goal price"] = redeem_goal_price
+            finishedAccount()
+            cleanLogs()
+            updateLogs()
 
     except FunctionTimedOut:
         prRed('[ERROR] Time out raised.\n')
@@ -3629,7 +3732,7 @@ def main():
     prArgs()
     loadAccounts()
     downloadWebDriver()
-    keep_alive()
+    # keep_alive()
 
     LANG, GEO, TZ = getCCodeLangAndOffset()
     if ARGS.account_browser:
