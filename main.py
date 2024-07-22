@@ -1292,7 +1292,13 @@ def locateQuestCard(browser: WebDriver, activity: dict) -> WebElement:
     
 def openDailySetActivity(browser: WebDriver, cardId: int):
         # browser.find_element(By.XPATH, f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a').click()
-        waitUntilClickable(browser, By.XPATH, f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a', 15)
+        # try:
+        #     waitUntilVisible(browser, By.XPATH, f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId+1}]/div/card-content/mee-rewards-daily-set-item-content/div/a', 15)
+        # except:
+        #     print("exception in clicking daily")
+        #     pass
+        # browser.execute_script(f'document.querySelector("mee-rewards-daily-set-section").children[0].querySelector("mee-card-group").children[0].children[{cardId}].scrollIntoView(true)')
+        # print(browser.execute_script(f'return document.querySelector("mee-rewards-daily-set-section").children[0].querySelector("mee-card-group").children[0].children[{cardId}].innerText'))
         card = browser.execute_script(f'return document.querySelector("mee-rewards-daily-set-section").children[0].querySelector("mee-card-group").children[0].children[{cardId}]')
         card.click()
         time.sleep(2)
@@ -1559,7 +1565,6 @@ def completeDailySet(browser: WebDriver):
         time.sleep(2)
 
     print('[DAILY SET]', 'Trying to complete the Daily Set...')
-    browser.execute_script("window.scrollTo(0, 1080)")
     d = getDashboardData(browser)
     error = False
     todayDate = datetime.today().strftime('%m/%d/%Y')
@@ -1576,8 +1581,9 @@ def completeDailySet(browser: WebDriver):
             # cardNumber = int(activity['offerId'][-1:])
             cardNumber = i
             print(f'Card Name: {activity["title"]}')
-            open_in_new_tab(browser, url = activity["destinationUrl"])
-            # openDailySetActivity(browser, cardId=cardNumber)
+            browser.execute_script("window.scrollTo(0, 1080)")
+            # open_in_new_tab(browser, url = activity["destinationUrl"])
+            openDailySetActivity(browser, cardId=cardNumber)
             i += 1
             if activity['promotionType'] == "urlreward":
                 if "poll" in activity['title']:
@@ -3530,7 +3536,8 @@ def farmer():
                     LOGS[CURRENT_ACCOUNT]['PC searches'] = True
                     updateLogs()
                     ERROR = False
-                    browser.quit()
+                browser.close()
+                browser.quit()
 
             if MOBILE:
                 with browserSetupv3(True, account.get('proxy', None)) as browser:
@@ -3549,7 +3556,8 @@ def farmer():
                         Searches(browser, True).bingSearches()
                         POINTS_COUNTER = getBingAccountPoints(browser)
                         prGreen('\n[BING] Finished Mobile Bing searches !')
-                    browser.quit()
+                browser.close()
+                browser.quit()
             # try:
             #     if redeem_goal_title != "" and redeem_goal_price <= POINTS_COUNTER:
             #         prGreen(f"[POINTS] Account ready to redeem {redeem_goal_title} for {redeem_goal_price} points.")
@@ -3813,6 +3821,10 @@ def kill_process_by_name(PROCNAME:str):
     for proc in psutil.process_iter(attrs=['pid', 'name']):
         if PROCNAME in proc.info['name']:
             proc.kill()
+
+def get_process_list():
+    for proc in psutil.process_iter(attrs=['pid', 'name']):
+        print(f'Processes After Kill{proc}')
 
 def get_version():
     """Get version from version.json"""
