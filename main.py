@@ -1579,7 +1579,7 @@ def completeDailySet(browser: WebDriver):
     todayDate = datetime.today().strftime('%m/%d/%Y')
     todayPack = []
     i = 0
-    for j in range(2):
+    for j in range(3):
         try:
             for date_, data in d['dailySetPromotions'].items():
                 if date_ == todayDate:
@@ -1645,10 +1645,13 @@ def completeDailySet(browser: WebDriver):
                                 print(
                                     '[DAILY SET]', 'Completing quiz of card ' + str(cardNumber))
                                 completeDailySetVariableActivity()
-            break
+            if j == 2:
+                break
+            resetTabs(browser)
+            i = 0
         except Exception as exc:
             displayError(exc)
-            if j == 2:
+            if j == 3:
                 error = True
             resetTabs(browser)
             i = 0
@@ -1823,6 +1826,10 @@ def completeMorePromotions(browser: WebDriver):
                 searchbar.submit()
                 time.sleep(7)
                 time.sleep(1.5)
+                waitUntilClickable(browser, By.XPATH, '//*[@id="sb_form_q"]', time_to_wait=20)
+                time.sleep(1.5)
+                searchbar = browser.find_element(By.XPATH, '//*[@id="sb_form_q"]')
+                time.sleep(1.5)
                 searchbar.click()
                 time.sleep(1.5)
                 browser.find_element(By.ID, "b_header").click()
@@ -1994,7 +2001,7 @@ def completeMorePromotions(browser: WebDriver):
     # i = 0
     for promotion in morePromotions:
         try:
-            promotionTitle = promotion["title"]
+            promotionTitle = promotion["title"].replace("\u200b", "").replace("\xa0", " ")
             # print(f"promotionTitle={promotionTitle}")
             if (promotion["complete"] is not False or promotion["pointProgressMax"] == 0):
                 # i += 1
